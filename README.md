@@ -60,6 +60,30 @@ The license of Iris does permit others to legally port Iris to Forge, and we are
 
 So, if you want to distribute a Forge port of Iris, we'd prefer if you let us know. Please don't just name your port "Iris Forge," "Iris for Forge," or "Iris Forge Port" either. Be original, and don't just hijack our name, unless we've given you permission to use one of those kinds of names. If a well-qualified group of people willing to maintain a Forge port of Iris does appear, then a name like "Iris Forge" might be appropriate - otherwise, it probably isn't appropriate.
 
+## Vulkan Port
+
+This fork is the **Iris Vulkan Port** — an experimental branch that integrates Iris with [VulkanMod](https://github.com/xCollateral/VulkanMod), enabling OptiFine-compatible shader packs to run on Minecraft's Vulkan rendering backend.
+
+### What it does
+
+The Vulkan port bridges Iris's shader pipeline with VulkanMod's Vulkan renderer. Instead of using OpenGL for shader execution, all rendering — terrain, entities, shadows, and fullscreen composite/deferred passes — goes through Vulkan. This includes:
+
+- **GLSL-to-SPIR-V compilation** of shader pack shaders for Vulkan pipeline consumption
+- **Terrain pipeline integration** with VulkanMod's compressed vertex format and chunk rendering system
+- **Shadow mapping** via Vulkan render passes and depth attachments
+- **Composite and deferred passes** using Vulkan graphics pipelines with UBO-based uniform upload
+- **Coordinate system adaptation** between OpenGL conventions (used by shader packs) and Vulkan conventions (depth range, Y-axis, texture coordinates)
+
+### What it's trying to accomplish
+
+The goal is to allow players to use their favorite OptiFine/Iris shader packs (such as Complementary Shaders, BSL, etc.) while running Minecraft through Vulkan for improved performance on modern GPUs. VulkanMod provides significant performance gains over OpenGL on many systems, but previously required disabling shader packs entirely. This port aims to eliminate that trade-off.
+
+### Current status
+
+- **Target**: Minecraft 1.21.1, Fabric, VulkanMod 0.4.8_dev
+- **Stage**: Active development — terrain rendering with shaders works, shadow mapping pipeline is functional, composite/deferred post-processing passes are operational
+- **Known issues**: Visual artifacts in volumetric lighting and color grading are being investigated and resolved
+
 ## Credits
 
 * **TheOnlyThing and Vaerian**, for creating the excellent logo
