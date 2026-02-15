@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "id": "iris-vulkan",
+  "version": "${version}",
+  "name": "Iris (Vulkan Port)",
+  "description": "A modern shaders mod for Minecraft ported to work with VulkanMod's Vulkan rendering backend",
+  "authors": [
+    "coderbot",
+    "IMS212",
+    "Justsnoopy30",
+    "FoundationGames"
+  ],
+  "contact": {
+    "homepage": "https://github.com/IrisShaders/Iris",
+    "sources": "https://github.com/IrisShaders/Iris.git",
+    "issues": "https://github.com/IrisShaders/Iris/issues"
+  },
+  "license": "LGPL-3.0-only",
+  "icon": "assets/iris/iris-logo.png",
+  "environment": "client",
+  "entrypoints": {
+    "modmenu": [
+      "net.irisshaders.iris.compat.modmenu.ModMenuIntegration"
+    ]
+  },
+  "mixins": [
+    "mixins.iris.json",
+    "iris-batched-entity-rendering.mixins.json",
+    "mixins.iris.fantastic.json",
+    "mixins.iris.vertexformat.json",
+    "mixins.iris.bettermipmaps.json",
+    "mixins.iris.compat.indigo.json",
+    "mixins.iris.compat.indium.json",
+    "mixins.iris.fixes.maxfpscrash.json"
+  ],
+  "accessWidener": "iris.accesswidener",
+  "depends": {
+    "fabricloader": ">=0.12.3",
+    "minecraft": [
+      "1.21.x"
+    ],
+    "vulkanmod": "*"
+  },
+  "breaks": {
+    "iris": "*",
+    "iris-explorer": "*",
+    "originsenhanced": "<=1.3.2",
+    "colormatic": "<=3.0.0",
+    "bedrockwaters": "<=1.6.0",
+    "batchedentityrendering": "*",
+    "canvas": "*",
+    "optifabric": "*",
+    "sodium": "*"
+  },
+  "custom": {
+    "mc-publish": {
+      "loaders": [
+        "fabric",
+        "quilt"
+      ]
+    }
+  }
+}
