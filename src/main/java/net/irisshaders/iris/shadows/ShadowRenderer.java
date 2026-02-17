@@ -500,8 +500,8 @@ public class ShadowRenderer {
 			levelRenderer.invokeRenderSectionLayer(RenderType.cutoutMipped(), cameraX, cameraY, cameraZ, MODELVIEW, shadowProjection);
 		}
 
-		// Log shadow terrain pass results (first 3 frames)
-		if (shadowTerrainLogCount <= 3) {
+		// Log shadow terrain pass results (first 3 frames only)
+		if (shadowTerrainLogCount < 3) {
 			Iris.logger.info("[SHADOW_DIAG] Shadow terrain pass complete. depthTexId={} noTransDepthTexId={}",
 				targets.getDepthTexture().getTextureId(),
 				targets.getDepthTextureNoTranslucents().getTextureId());
@@ -545,6 +545,15 @@ public class ShadowRenderer {
 		MultiBufferSource.BufferSource bufferSource = buffers.bufferSource();
 		EntityRenderDispatcher dispatcher = levelRenderer.getEntityRenderDispatcher();
 
+		// Push the shadow ModelView matrix to RenderSystem so that
+		// ExtendedShader.apply() reads the shadow camera transform (not identity).
+		// This follows the same pattern as HandRenderer.java lines 93-95/132-134.
+		// Without this, RenderSystem.getModelViewMatrix() returns IDENTITY during
+		// shadow entity rendering, corrupting the shadow map.
+		RenderSystem.getModelViewStack().pushMatrix();
+		RenderSystem.getModelViewStack().set(modelView.last().pose());
+		RenderSystem.applyModelViewMatrix();
+
 		if (shouldRenderEntities) {
 			renderedShadowEntities = renderEntities(levelRenderer, dispatcher, bufferSource, modelView, tickDelta, entityShadowFrustum, cameraX, cameraY, cameraZ);
 		} else if (shouldRenderPlayer) {
@@ -568,6 +577,10 @@ public class ShadowRenderer {
 			fullyBufferedMultiBufferSource.readyUp();
 
 		bufferSource.endBatch();
+
+		// Pop the shadow ModelView matrix — restore whatever was on the stack before.
+		RenderSystem.getModelViewStack().popMatrix();
+		RenderSystem.applyModelViewMatrix();
 
 		copyPreTranslucentDepth(levelRenderer);
 

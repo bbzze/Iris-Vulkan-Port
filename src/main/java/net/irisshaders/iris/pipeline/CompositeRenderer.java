@@ -287,6 +287,11 @@ public class CompositeRenderer {
 			int beginHeight = (int) (renderPass.viewHeight * renderPass.viewportScale.viewportY());
 			RenderSystem.viewport(beginWidth, beginHeight, (int) scaledWidth, (int) scaledHeight);
 
+			// Override with standard Vulkan viewport (Y=0 at top) for composite/deferred passes.
+			// This fixes texelFetch(tex, ivec2(gl_FragCoord.xy), 0) which relies on
+			// gl_FragCoord.y matching the Vulkan image row order (0 at top).
+			net.vulkanmod.vulkan.Renderer.setInvertedViewport(beginWidth, beginHeight, (int) scaledWidth, (int) scaledHeight);
+
 			// In Vulkan, blend state is baked into the pipeline. Set blend state
 			// BEFORE program.use() so bindGraphicsPipeline() captures the correct state.
 			if (renderPass.blendModeOverride != null) {
@@ -294,6 +299,11 @@ public class CompositeRenderer {
 			} else {
 				RenderSystem.disableBlend();
 			}
+
+			// With standard Vulkan viewport, fullscreen quad triangles wind clockwise
+			// (back-facing for VK_FRONT_FACE_COUNTER_CLOCKWISE). Disable culling
+			// so the quad renders regardless of winding order.
+			RenderSystem.disableCull();
 
 			renderPass.program.use();
 
@@ -508,7 +518,7 @@ public class CompositeRenderer {
 		int frame = net.vulkanmod.vulkan.Renderer.getCurrentFrame();
 		if (frame == lastDiagFrame) return;
 		lastDiagFrame = frame;
-		if (diagFrameCount++ > 5) return;
+		if (diagFrameCount++ > 0) return;
 
 		StringBuilder sb = new StringBuilder();
 		sb.append("\n[DIAG] === Composite Pass Texture State (frame ").append(frame).append(") ===\n");

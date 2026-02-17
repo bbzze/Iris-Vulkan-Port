@@ -292,9 +292,12 @@ public class IrisTerrainPipelineCompiler {
 				"layout(location=2) in uvec2 a_TexCoord");
 		}
 
-		// Fix a_LightCoord: already ivec2 (SINT format) — just add location
-		source = source.replaceAll("(?:layout\\s*\\([^)]*\\)\\s*)?in\\s+ivec2\\s+a_LightCoord",
-			"layout(location=3) in ivec2 a_LightCoord");
+		// Convert a_LightCoord to a constant instead of a vertex input.
+		// VulkanMod's CompressedVertexBuilder never writes UV2 (bytes 16-19 of the
+		// 20-byte stride), so location 3 reads uninitialized garbage.
+		// Light data is correctly extracted from a_PosId.w in fixTerrainPositionDecoding().
+		source = source.replaceAll("(?:layout\\s*\\([^)]*\\)\\s*)?in\\s+ivec2\\s+a_LightCoord\\s*;",
+			"ivec2 a_LightCoord = ivec2(0); // UV2 not written by CompressedVertexBuilder");
 
 		// === Step 2: Strip 'in' from standard Iris vertex inputs ===
 		// These are computed by _vert_init() from the terrain attributes, NOT from vertex buffer.
@@ -326,7 +329,7 @@ public class IrisTerrainPipelineCompiler {
 		// === Step 4: Catch-all for ANY remaining non-terrain 'in' declarations ===
 		// Strip 'in' from anything that's not one of our 4 terrain attributes.
 		// This prevents shaderc auto_map_locations from creating conflicts.
-		String[] terrainAttribs = {"a_PosId", "a_Color", "_iris_TexCoord_raw", "a_TexCoord", "a_LightCoord"};
+		String[] terrainAttribs = {"a_PosId", "a_Color", "_iris_TexCoord_raw", "a_TexCoord"};
 		Set<String> terrainSet = new HashSet<>(Arrays.asList(terrainAttribs));
 		StringBuilder sb = new StringBuilder();
 		for (String line : source.split("\n", -1)) {
@@ -385,35 +388,96 @@ public class IrisTerrainPipelineCompiler {
 	 */
 	private String fixTerrainPositionDecoding(String source) {
 		// Replace Iris/Sodium position decoding (unsigned + offset) with VulkanMod's (signed, no offset).
-		// The Iris preprocessor may output the constant as 0.00048828125, 4.8828125E-4f, etc.
-		// Use regex to match any numeric format for the 1/2048 constant and -8.0 offset.
+		// The glsl_transformer AST printer may reformat the expression: drop outer parentheses,
+		// change numeric literal format, rewrite "+-" as "-", wrap negatives in parens, etc.
+		// We use multiple patterns in priority order to handle these variations.
 		//
 		// Iris:     _vert_position = (vec3(a_PosId.xyz) * 4.8828125E-4f + -8.0f);
 		// VulkanMod: pos = fma(Position.xyz, vec3(1/2048), ChunkOffset + baseOffset);
 		// We include baseOffset (from gl_InstanceIndex) in _vert_position so _get_draw_translation() can return 0.
+		String posReplacement = "_vert_position = vec3(a_PosId.xyz) * vec3(1.0 / 2048.0) + " +
+			"vec3(bitfieldExtract(ivec3(gl_InstanceIndex) >> ivec3(0, 16, 8), 0, 8))";
+
+		// Pattern 1: Original — with outer parens: (vec3(a_PosId.xyz) * CONST + -8.0)
 		String replaced = source.replaceAll(
 			"_vert_position\\s*=\\s*\\(vec3\\(a_PosId\\.xyz\\)\\s*\\*\\s*[0-9.eE+-]+f?\\s*\\+\\s*-8\\.0f?\\)",
-			"_vert_position = vec3(a_PosId.xyz) * vec3(1.0 / 2048.0) + " +
-			"vec3(bitfieldExtract(ivec3(gl_InstanceIndex) >> ivec3(0, 16, 8), 0, 8))");
+			posReplacement);
+
+		// Pattern 2: No outer parens, "- 8.0" instead of "+ -8.0"
+		if (replaced.equals(source)) {
+			replaced = source.replaceAll(
+				"_vert_position\\s*=\\s*vec3\\s*\\(\\s*a_PosId\\.xyz\\s*\\)\\s*\\*\\s*[0-9.eE+-]+f?\\s*(?:\\+\\s*-|-)\\s*8\\.0f?",
+				posReplacement);
+		}
+
+		// Pattern 3: Parenthesized negative: + (-8.0) or (+ (-8.0f))
+		if (replaced.equals(source)) {
+			replaced = source.replaceAll(
+				"_vert_position\\s*=\\s*\\(?\\s*vec3\\s*\\(\\s*a_PosId\\.xyz\\s*\\)\\s*\\*\\s*[0-9.eE+-]+f?\\s*\\+\\s*\\(\\s*-\\s*8\\.0f?\\s*\\)\\s*\\)?",
+				posReplacement);
+		}
+
+		// Pattern 4: Broadest fallback — any _vert_position assignment referencing a_PosId.xyz
+		// in the same statement (before the semicolon). Safe because this only appears in _vert_init().
+		if (replaced.equals(source)) {
+			replaced = source.replaceAll(
+				"_vert_position\\s*=\\s*[^;]*?vec3\\s*\\(\\s*a_PosId\\.xyz\\s*\\)[^;]*",
+				posReplacement);
+		}
 
 		if (replaced.equals(source)) {
 			Iris.logger.warn("[IrisTerrainPipelineCompiler] WARNING: _vert_position decoding pattern NOT matched! " +
-				"Position decoding may be wrong.");
+				"Position decoding may be wrong. Searching for context...");
+			int idx = source.indexOf("_vert_position");
+			if (idx >= 0) {
+				int end = source.indexOf(";", idx);
+				if (end > idx) {
+					Iris.logger.warn("[IrisTerrainPipelineCompiler] Found: {}",
+						source.substring(idx, Math.min(end + 1, idx + 200)).trim());
+				}
+			} else {
+				Iris.logger.warn("[IrisTerrainPipelineCompiler] _vert_position NOT FOUND in shader source at all!");
+			}
 		} else {
 			Iris.logger.info("[IrisTerrainPipelineCompiler] Fixed _vert_position decoding for VulkanMod COMPRESSED_TERRAIN");
 		}
 		source = replaced;
 
 		// Replace draw_id extraction — a_PosId.w contains lightmap data in VulkanMod, not draw ID.
-		// Match any hex format (0xFFu, 0xffu, etc.)
+		// Handle with/without parens, with/without 'u' suffix on shift amount and mask constant.
+		String drawIdBefore = source;
 		source = source.replaceAll(
-			"_draw_id\\s*=\\s*\\(a_PosId\\.w\\s*>>\\s*8u\\)\\s*&\\s*0x[fF]+u",
+			"_draw_id\\s*=\\s*\\(?\\s*a_PosId\\.w\\s*>>\\s*8u?\\s*\\)?\\s*&\\s*(?:0x[0-9a-fA-F]+u?|\\d+u?)",
 			"_draw_id = 0u");
+		if (source.equals(drawIdBefore)) {
+			// Fallback: match any _draw_id assignment referencing a_PosId
+			source = source.replaceAll(
+				"_draw_id\\s*=\\s*[^;]*a_PosId[^;]*",
+				"_draw_id = 0u");
+		}
 
 		// Replace _material_params extraction — same issue, a_PosId.w is lightmap data
 		source = source.replaceAll(
-			"_material_params\\s*=\\s*\\(a_PosId\\.w\\s*>>\\s*0u\\)\\s*&\\s*0x[fF]+u",
+			"_material_params\\s*=\\s*\\(?\\s*a_PosId\\.w\\s*>>\\s*0u?\\s*\\)?\\s*&\\s*(?:0x[0-9a-fA-F]+u?|\\d+u?)",
 			"_material_params = 0u");
+
+		// Extract lightmap from a_PosId.w instead of a_LightCoord (UV2).
+		// VulkanMod's COMPRESSED_TERRAIN format packs light into position.W (offset 6-7)
+		// but never writes UV2 (offset 16-19), so a_LightCoord is always ivec2(0,0).
+		// The packed short contains: low byte = blockLight (0-240), high byte = skyLight (0-240).
+		// VulkanMod packing: short l = (short)(((light >>> 8) & 0xFF00) | (light & 0xFF))
+		// where light = blockLight | (skyLight << 16), both in 0-240 range (level * 16).
+		source = source.replaceAll(
+			"_vert_tex_light_coord\\s*=\\s*a_LightCoord\\s*;",
+			"_vert_tex_light_coord = ivec2(a_PosId.w & 0xFF, (a_PosId.w >> 8) & 0xFF);");
+
+		// Fix midCoord: mc_midTexCoord is unavailable in COMPRESSED_TERRAIN (defaults to vec2(0)),
+		// which makes iris_MidTex = (0,0,0,1) and midCoord = (0,0). This breaks atlas border
+		// color averaging and tile randomization. Use texCoord instead — not the exact center
+		// of the block's atlas region, but much better than (0,0).
+		source = source.replaceAll(
+			"midCoord\\s*=\\s*\\(mat4\\(1\\.0f?\\)\\s*\\*\\s*iris_MidTex\\)\\.st\\s*;",
+			"midCoord = texCoord;");
 
 		// Replace _get_draw_translation() — offset is already in _vert_position via baseOffset
 		source = source.replaceAll(
@@ -807,6 +871,7 @@ public class IrisTerrainPipelineCompiler {
 	 * Must be called before terrain draw commands.
 	 */
 	private int uniformLogCounter = 0;
+	private int gbufferProjLogCount = 0;
 
 	// Frame timing state
 	private long lastFrameNanos = System.nanoTime();
@@ -837,44 +902,103 @@ public class IrisTerrainPipelineCompiler {
 		float[] mvArr = new float[16];
 		modelView.get(mvArr);
 
+		// VulkanMod may pass a projection matrix with infinite or incorrect m00/m11 values.
+		// Always rebuild a clean projection from actual game parameters for gbuffer passes.
+		org.joml.Matrix4f projection_clean = new org.joml.Matrix4f(projection);
+		if (!isShadowPass && projection_clean.m23() != 0) { // perspective projection
+			float far = client.options != null ? client.options.getEffectiveRenderDistance() * 16.0f : 256.0f;
+			float near = 0.05f;
+
+			// Always compute m00/m11 from FOV and aspect ratio — VulkanMod's projection
+			// may have infinite or non-standard values that break shader pack lighting.
+			double fovDegrees = 70.0; // default
+			try {
+				if (client.gameRenderer != null) {
+					fovDegrees = ((net.irisshaders.iris.mixin.GameRendererAccessor) client.gameRenderer)
+						.invokeGetFov(client.gameRenderer.getMainCamera(),
+							client.getTimer().getGameTimeDeltaPartialTick(true), true);
+				}
+			} catch (Exception ignored) {}
+			// Guard against zero/invalid FOV during initialization
+			if (fovDegrees < 1.0 || !Double.isFinite(fovDegrees)) fovDegrees = 70.0;
+			float fovRad = (float)(fovDegrees * Math.PI / 180.0);
+			float tanHalfFov = (float) Math.tan(fovRad / 2.0);
+			var window = client.getWindow();
+			float aspect = (float) window.getWidth() / (float) window.getHeight();
+			projection_clean.m00(1.0f / (aspect * tanHalfFov));
+			projection_clean.m11(1.0f / tanHalfFov);
+
+			// Fix infinite-far depth elements (m22, m32) with finite far
+			projection_clean.m22(-far / (far - near));
+			projection_clean.m32(-far * near / (far - near));
+
+			if (gbufferProjLogCount < 1) {
+				Iris.logger.info("[PROJ_FIX] Gbuffer projection rebuilt: rawM00={} rawM11={} -> m00={} m11={} fov={} aspect={} far={}",
+					String.format("%.6f", projection.m00()), String.format("%.6f", projection.m11()),
+					String.format("%.4f", projection_clean.m00()), String.format("%.4f", projection_clean.m11()),
+					String.format("%.1f", fovDegrees), String.format("%.3f", aspect),
+					String.format("%.1f", far));
+				gbufferProjLogCount++;
+			}
+		}
+
 		// Original Vulkan-style projection for iris_ProjectionMatrix (used by vertex
 		// shader for gl_Position — must stay Vulkan [0,1] depth range for correct rendering)
 		float[] projVkArr = new float[16];
-		projection.get(projVkArr);
+		projection_clean.get(projVkArr);
 
-		org.joml.Matrix4f projVkInv = new org.joml.Matrix4f(projection).invert();
+		org.joml.Matrix4f projVkInv = new org.joml.Matrix4f(projection_clean).invert();
 		float[] projVkInvArr = new float[16];
 		projVkInv.get(projVkInvArr);
 
 		// OpenGL-style projection for gbufferProjection (used by shader pack code for
 		// position reconstruction via: clipZ = depth * 2.0 - 1.0, then gbufferProjectionInverse)
-		// VulkanMod overrides getDepthFar() to return POSITIVE_INFINITY, but shader packs
-		// use the finite 'far' uniform for depth linearization (GetDepth/GetDistX).
-		// Replace infinite-far depth elements with finite-far to keep consistency.
-		org.joml.Matrix4f projGL = new org.joml.Matrix4f(projection);
-		if (projGL.m23() != 0 && !isShadowPass) { // perspective projection, non-shadow
-			float far = client.options != null ? client.options.getEffectiveRenderDistance() * 16.0f : 256.0f;
-			float near = 0.05f;
-			projGL.m22(-far / (far - near));
-			projGL.m32(-far * near / (far - near));
+		org.joml.Matrix4f projGL = new org.joml.Matrix4f(projection_clean);
+		// VulkanMod's Matrix4fM mixin forces zZeroToOne=true on perspective matrices
+		// created via JOML .perspective(), so convert back to OpenGL [-1,1] depth range:
+		//   m22_gl = 2*m22_vk - m23_vk, m32_gl = 2*m32_vk - m33_vk
+		// BUT skip for shadow pass — the shadow ortho matrix from ShadowMatrices.createOrthoMatrix()
+		// is constructed with raw column values (NOT through JOML .ortho()), so VulkanMod's
+		// Matrix4fM mixin does NOT apply zZeroToOne conversion. It's already OpenGL-style.
+		// Applying vulkanToOpenGLDepthRange would DOUBLE-CONVERT m22 (e.g., -2/(f-n) → -4/(f-n)),
+		// making iris_ProjectionMatrix != shadowProjection. The shadow vertex shader does:
+		//   position = shadowProjectionInverse * iris_ftransform()
+		// which requires iris_ProjectionMatrix == shadowProjection for the chain to cancel properly.
+		// With the double-conversion, shadow depth values are corrupted → VL overexposure.
+		if (!isShadowPass) {
+			projGL.m22(2.0f * projGL.m22() - projGL.m23());
+			projGL.m32(2.0f * projGL.m32() - projGL.m33());
 		}
-		// VulkanMod's Matrix4fM mixin forces zZeroToOne=true, so convert back:
-		// m22_gl = 2*m22_vk - m23_vk, m32_gl = 2*m32_vk - m33_vk
-		projGL.m22(2.0f * projGL.m22() - projGL.m23());
-		projGL.m32(2.0f * projGL.m32() - projGL.m33());
-		// Negate Y scaling (m11) to compensate for VulkanMod's negative viewport Y-flip.
-		// In Vulkan with negative viewport, gl_FragCoord.y=0 is at the TOP of the screen,
-		// so screenPos.y=0 maps to clipPos.y=-1. Without negation, gbufferProjectionInverse
-		// would map this to negative viewPos.y, but top of screen should be positive Y.
-		// Negating m11 makes the inverse compensate: viewPos.y = (-1/(-m11)) = 1/m11 = correct.
-		// This matches Program.writeGbufferUniforms() which does the same for composite passes.
-		projGL.m11(-projGL.m11());
+
+		// IMPORTANT: Do NOT negate m11 for the terrain/entity UBO's gbufferProjection.
+		// Terrain/entity fragment shaders use gl_FragCoord for ScreenToView() position
+		// reconstruction. With VulkanMod's negative viewport, gl_FragCoord follows OpenGL
+		// convention (Y=0 at bottom, Y increases upward), so no Y-flip compensation is
+		// needed. Negating m11 here would invert the reconstructed viewPos.y, causing
+		// wrong specular, fresnel, shadow, and fog calculations → kaleidoscope corruption.
+		//
+		// The m11 negation is ONLY needed for composite/deferred passes (Program.java),
+		// where CompositeTransformer flips UV.y (texCoord.y = 1.0 - UV0.y), creating a
+		// non-standard mapping that requires compensating the projection inverse.
 		float[] projGLArr = new float[16];
 		projGL.get(projGLArr);
 
 		org.joml.Matrix4f projGLInv = new org.joml.Matrix4f(projGL).invert();
 		float[] projGLInvArr = new float[16];
 		projGLInv.get(projGLInvArr);
+
+		// For the shadow pass iris_ProjectionMatrix, negate m11 to compensate for
+		// VulkanMod's negative viewport during shadow rendering.
+		float[] projGLShadowArr = null;
+		float[] projGLShadowInvArr = null;
+		if (isShadowPass) {
+			org.joml.Matrix4f projGLShadow = new org.joml.Matrix4f(projGL);
+			projGLShadow.m11(-projGLShadow.m11());
+			projGLShadowArr = new float[16];
+			projGLShadow.get(projGLShadowArr);
+			projGLShadowInvArr = new float[16];
+			new org.joml.Matrix4f(projGLShadow).invert().get(projGLShadowInvArr);
+		}
 
 		org.joml.Matrix4f mvInv = new org.joml.Matrix4f(modelView).invert();
 		float[] mvInvArr = new float[16];
@@ -888,16 +1012,19 @@ public class IrisTerrainPipelineCompiler {
 			int off = buf.getFieldOffset(name);
 			if (off >= 0) buf.writeMat4f(off, mvArr);
 		}
-		// iris_ProjectionMatrix: OpenGL-style during shadow pass (shadow vertex shader
-		// applies custom z manipulation expecting OpenGL NDC), Vulkan-style for gbuffer
+		// iris_ProjectionMatrix: OpenGL-style with m11 negated during shadow pass (shadow
+		// vertex shader applies custom z manipulation expecting OpenGL NDC, and the
+		// negative viewport Y-flip needs compensation), Vulkan-style for gbuffer
 		{
 			int off = buf.getFieldOffset("iris_ProjectionMatrix");
-			if (off >= 0) buf.writeMat4f(off, isShadowPass ? projGLArr : projVkArr);
+			if (off >= 0) buf.writeMat4f(off, isShadowPass ? projGLShadowArr : projVkArr);
 		}
 		// gbufferProjection: OpenGL-style for shader pack position reconstruction
 		{
 			int off = buf.getFieldOffset("gbufferProjection");
-			if (off >= 0) buf.writeMat4f(off, projGLArr);
+			if (off >= 0) {
+				buf.writeMat4f(off, projGLArr);
+			}
 		}
 		for (String name : new String[]{"iris_ModelViewMatrixInverse", "gbufferModelViewInverse"}) {
 			int off = buf.getFieldOffset(name);
@@ -906,7 +1033,7 @@ public class IrisTerrainPipelineCompiler {
 		// iris_ProjectionMatrixInverse: matches iris_ProjectionMatrix style
 		{
 			int off = buf.getFieldOffset("iris_ProjectionMatrixInverse");
-			if (off >= 0) buf.writeMat4f(off, isShadowPass ? projGLInvArr : projVkInvArr);
+			if (off >= 0) buf.writeMat4f(off, isShadowPass ? projGLShadowInvArr : projVkInvArr);
 		}
 		// gbufferProjectionInverse: OpenGL-style inverse
 		{
@@ -1281,10 +1408,7 @@ public class IrisTerrainPipelineCompiler {
 		writeFloatField(buf, "iris_FogDensity", CapturedRenderingState.INSTANCE.getFogDensity());
 		writeIntField(buf, "heavyFog", 0);
 
-		if (uniformLogCounter < 1) {
-			Iris.logger.debug("[IrisTerrainUBO] UBO layout: gbufferMV@{} gbufferProj@{} cameraPosition@{} viewWidth@{} totalBytes={}",
-				buf.getFieldOffset("gbufferModelView"), buf.getFieldOffset("gbufferProjection"),
-				buf.getFieldOffset("cameraPosition"), buf.getFieldOffset("viewWidth"), buf.getUsedSize());
+		if (uniformLogCounter < 1 && !isShadowPass) {
 			uniformLogCounter++;
 		}
 

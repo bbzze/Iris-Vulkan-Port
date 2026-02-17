@@ -17,7 +17,9 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkImageSubresourceRange;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.lwjgl.vulkan.VK10.*;
 
@@ -47,14 +49,48 @@ public class GlFramebuffer extends GlResource {
 	private RenderPass vulkanRenderPassClear; // CLEAR depth on first bind per frame
 	private RenderPass vulkanRenderPassLoad;  // LOAD depth on subsequent binds
 
-	// Frame tracking: CLEAR depth once per frame PER framebuffer.
-	// Must be per-instance because different GlFramebuffers may have different depth textures.
-	// A static variable would let the first framebuffer to bind claim the clear,
-	// leaving other framebuffers' depth textures uninitialized (all zeros → all fragments fail LEQUAL).
-	private int lastDepthClearFrame = -1;
+	// Frame tracking: CLEAR depth once per frame PER DEPTH TEXTURE (not per GlFramebuffer).
+	// Multiple GlFramebuffers may share the same depth texture with different color attachments
+	// (e.g., terrain vs entity DRAWBUFFERS). If each independently clears depth, the second
+	// clear wipes existing depth data (terrain depth wiped by entity clear → entity triangles
+	// overwrite terrain everywhere in the gbuffer, producing full-screen artifacts).
+	// Using per-depth-texture tracking ensures only the first bind clears depth.
+	private static final it.unimi.dsi.fastutil.ints.Int2IntMap depthTexClearFrame =
+		new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
 
 	// Track last bound Iris framebuffer for color attachment layout management
 	private static GlFramebuffer lastBoundIrisFramebuffer = null;
+
+	// Global cache: VulkanMod Framebuffer objects keyed by attachment hash.
+	// Multiple GlFramebuffer instances with identical attachments (same VulkanImages)
+	// share the SAME VulkanMod Framebuffer. This is critical because VulkanMod's
+	// Renderer.beginRendering() uses Java object identity to detect framebuffer changes —
+	// if terrain and entity GlFramebuffers each create their own Framebuffer, the renderer
+	// sees "different" objects and restarts the render pass on every entity draw.
+	// With sharing, beginRendering() detects same object and keeps the pass active.
+	private static final Map<Integer, CachedFramebuffer> framebufferCache = new HashMap<>();
+
+	private static class CachedFramebuffer {
+		final Framebuffer framebuffer;
+		final RenderPass renderPassClear;
+		final RenderPass renderPassLoad;
+		final int colorFinalLayout;
+		int refCount; // Track how many GlFramebuffers reference this
+
+		CachedFramebuffer(Framebuffer fb, RenderPass clear, RenderPass load, int colorFinalLayout) {
+			this.framebuffer = fb;
+			this.renderPassClear = clear;
+			this.renderPassLoad = load;
+			this.colorFinalLayout = colorFinalLayout;
+			this.refCount = 1;
+		}
+
+		void cleanUp() {
+			renderPassClear.cleanUp();
+			renderPassLoad.cleanUp();
+			framebuffer.cleanUp(false); // Don't free images - owned by Iris RenderTargets
+		}
+	}
 
 	// Configurable final layout for color attachments.
 	// Default to SHADER_READ_ONLY_OPTIMAL because VulkanMod's createRenderPass() adds
@@ -142,6 +178,14 @@ public class GlFramebuffer extends GlResource {
 		return currentDrawBuffers;
 	}
 
+	/**
+	 * Returns the cached VulkanMod Framebuffer, or null if not yet created.
+	 * Used by ExtendedShader to check if the target framebuffer is already bound.
+	 */
+	public Framebuffer getVulkanFramebuffer() {
+		return vulkanFramebuffer;
+	}
+
 	// Track which attachment set is cached so we know when to recreate
 	private int cachedAttachmentHash = 0;
 
@@ -176,95 +220,136 @@ public class GlFramebuffer extends GlResource {
 			}
 		}
 
-		// Recreate VulkanMod framebuffer if attachments or underlying VkImages changed
+		// Include colorFinalLayout in hash so framebuffers with different final layouts
+		// (e.g., SHADER_READ_ONLY vs COLOR_ATTACHMENT_OPTIMAL) get different cache entries.
+		int cacheKey = attachmentHash * 31 + colorFinalLayout;
+
+		// Look up or create VulkanMod framebuffer from global cache.
+		// Multiple GlFramebuffer instances with identical attachments share the SAME
+		// VulkanMod Framebuffer, so Renderer.beginRendering()'s identity check
+		// (this.boundFramebuffer != framebuffer) detects no change and skips
+		// the render pass restart. This eliminates the terrain→entity ping-pong.
 		if (vulkanFramebuffer == null || cachedAttachmentHash != attachmentHash) {
-			cleanUpVulkanResources();
-
-			// Collect VulkanImages for ALL color attachments (MRT)
-			List<VulkanImage> colorImages = new ArrayList<>();
-			int maxIndex = 0;
-			for (Int2IntMap.Entry entry : colorAttachments.int2IntEntrySet()) {
-				if (entry.getIntKey() > maxIndex) maxIndex = entry.getIntKey();
-			}
-
-			for (int i = 0; i <= maxIndex; i++) {
-				if (!colorAttachments.containsKey(i)) continue;
-				int texId = colorAttachments.get(i);
-				if (texId <= 0) continue;
-
-				GlTexture glTex = GlTexture.getTexture(texId);
-				if (glTex == null || glTex.getVulkanImage() == null) {
-					Iris.logger.warn("GlFramebuffer.bind(): No VulkanImage for color attachment {} (tex {}) in FB {}",
-						i, texId, getGlId());
-					continue;
-				}
-				colorImages.add(glTex.getVulkanImage());
-			}
-
-			// Look up VulkanImage for depth attachment (optional)
-			VulkanImage depthImage = null;
-			if (hasDepthAttachment && depthTexId > 0) {
-				GlTexture glDepthTex = GlTexture.getTexture(depthTexId);
-				if (glDepthTex != null) {
-					depthImage = glDepthTex.getVulkanImage();
+			// Detach from previous cache entry if any
+			if (cachedAttachmentHash != 0) {
+				CachedFramebuffer prev = framebufferCache.get(cachedAttachmentHash * 31 + colorFinalLayout);
+				if (prev != null) {
+					prev.refCount--;
+					if (prev.refCount <= 0) {
+						framebufferCache.remove(cachedAttachmentHash * 31 + colorFinalLayout);
+						prev.cleanUp();
+					}
 				}
 			}
+			// Clear per-instance references (don't clean up — cache owns them)
+			vulkanFramebuffer = null;
+			vulkanRenderPassClear = null;
+			vulkanRenderPassLoad = null;
 
-			if (colorImages.isEmpty() && depthImage == null) {
-				Iris.logger.warn("GlFramebuffer.bind(): No valid VulkanImages for FB {}", getGlId());
-				return;
-			}
-
-			// Create VulkanMod Framebuffer with MRT support
-			if (colorImages.size() == 1) {
-				vulkanFramebuffer = Framebuffer.builder(colorImages.get(0), depthImage).build();
+			// Check global cache
+			CachedFramebuffer cached = framebufferCache.get(cacheKey);
+			if (cached != null && cached.colorFinalLayout == colorFinalLayout) {
+				// Reuse cached framebuffer — this is the key optimization
+				vulkanFramebuffer = cached.framebuffer;
+				vulkanRenderPassClear = cached.renderPassClear;
+				vulkanRenderPassLoad = cached.renderPassLoad;
+				cached.refCount++;
 			} else {
-				vulkanFramebuffer = Framebuffer.builder(colorImages, depthImage).build();
-			}
+				// Cache miss — create new VulkanMod Framebuffer
 
-			// Create TWO render pass variants: one with CLEAR depth, one with LOAD depth.
-			// Color attachments always use LOAD (preserve existing content).
-			// CLEAR variant is used on first bind per frame to initialize depth to 1.0.
-			// LOAD variant is used on subsequent binds to preserve accumulated depth.
+				// Collect VulkanImages for ALL color attachments (MRT)
+				List<VulkanImage> colorImages = new ArrayList<>();
+				int maxIndex = 0;
+				for (Int2IntMap.Entry entry : colorAttachments.int2IntEntrySet()) {
+					if (entry.getIntKey() > maxIndex) maxIndex = entry.getIntKey();
+				}
 
-			// --- CLEAR depth variant ---
-			RenderPass.Builder rpClearBuilder = RenderPass.builder(vulkanFramebuffer);
-			configureColorAttachments(rpClearBuilder);
-			if (depthImage != null) {
-				rpClearBuilder.getDepthAttachmentInfo()
-					.setOps(VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE)
-					.setFinalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-			}
-			vulkanRenderPassClear = rpClearBuilder.build();
+				for (int i = 0; i <= maxIndex; i++) {
+					if (!colorAttachments.containsKey(i)) continue;
+					int texId = colorAttachments.get(i);
+					if (texId <= 0) continue;
 
-			// --- LOAD depth variant ---
-			RenderPass.Builder rpLoadBuilder = RenderPass.builder(vulkanFramebuffer);
-			configureColorAttachments(rpLoadBuilder);
-			if (depthImage != null) {
-				rpLoadBuilder.getDepthAttachmentInfo()
-					.setOps(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE)
-					.setFinalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+					GlTexture glTex = GlTexture.getTexture(texId);
+					if (glTex == null || glTex.getVulkanImage() == null) {
+						Iris.logger.warn("GlFramebuffer.bind(): No VulkanImage for color attachment {} (tex {}) in FB {}",
+							i, texId, getGlId());
+						continue;
+					}
+					colorImages.add(glTex.getVulkanImage());
+				}
+
+				// Look up VulkanImage for depth attachment (optional)
+				VulkanImage depthImage = null;
+				if (hasDepthAttachment && depthTexId > 0) {
+					GlTexture glDepthTex = GlTexture.getTexture(depthTexId);
+					if (glDepthTex != null) {
+						depthImage = glDepthTex.getVulkanImage();
+					}
+				}
+
+				if (colorImages.isEmpty() && depthImage == null) {
+					Iris.logger.warn("GlFramebuffer.bind(): No valid VulkanImages for FB {}", getGlId());
+					return;
+				}
+
+				// Create VulkanMod Framebuffer with MRT support
+				Framebuffer newFb;
+				if (colorImages.size() == 1) {
+					newFb = Framebuffer.builder(colorImages.get(0), depthImage).build();
+				} else {
+					newFb = Framebuffer.builder(colorImages, depthImage).build();
+				}
+
+				// Create TWO render pass variants: CLEAR depth and LOAD depth
+				RenderPass.Builder rpClearBuilder = RenderPass.builder(newFb);
+				configureColorAttachments(rpClearBuilder);
+				if (depthImage != null) {
+					rpClearBuilder.getDepthAttachmentInfo()
+						.setOps(VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE)
+						.setFinalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				}
+				RenderPass rpClear = rpClearBuilder.build();
+
+				RenderPass.Builder rpLoadBuilder = RenderPass.builder(newFb);
+				configureColorAttachments(rpLoadBuilder);
+				if (depthImage != null) {
+					rpLoadBuilder.getDepthAttachmentInfo()
+						.setOps(VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE)
+						.setFinalLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+				}
+				RenderPass rpLoad = rpLoadBuilder.build();
+
+				// Store in cache
+				CachedFramebuffer newCached = new CachedFramebuffer(newFb, rpClear, rpLoad, colorFinalLayout);
+				// Remove stale entry if present
+				CachedFramebuffer stale = framebufferCache.put(cacheKey, newCached);
+				if (stale != null && stale.refCount <= 0) {
+					stale.cleanUp();
+				}
+
+				vulkanFramebuffer = newFb;
+				vulkanRenderPassClear = rpClear;
+				vulkanRenderPassLoad = rpLoad;
 			}
-			vulkanRenderPassLoad = rpLoadBuilder.build();
 
 			cachedAttachmentHash = attachmentHash;
 		}
 
-		// Determine which render pass to use: CLEAR depth on first bind per frame, LOAD otherwise
+		// Determine which render pass to use: CLEAR depth on first bind per frame, LOAD otherwise.
+		// Track per DEPTH TEXTURE ID (not per GlFramebuffer instance) to prevent terrain/entity
+		// framebuffers sharing the same depth from double-clearing.
 		int currentFrame = Renderer.getCurrentFrame();
-		boolean clearDepth = hasDepthAttachment && (currentFrame != lastDepthClearFrame);
-		if (clearDepth) {
-			lastDepthClearFrame = currentFrame;
+		boolean clearDepth = false;
+		if (hasDepthAttachment && depthTexId > 0) {
+			int lastClear = depthTexClearFrame.getOrDefault(depthTexId, -1);
+			if (lastClear != currentFrame) {
+				clearDepth = true;
+				depthTexClearFrame.put(depthTexId, currentFrame);
+			}
 		}
 		RenderPass renderPass = clearDepth ? vulkanRenderPassClear : vulkanRenderPassLoad;
 
-		// Let VulkanMod handle everything: endRenderPass, layout transitions, viewport, scissor.
-		// VulkanMod's RenderPass.beginRenderPass() already transitions color attachments to
-		// COLOR_ATTACHMENT_OPTIMAL and depth to DEPTH_STENCIL_ATTACHMENT_OPTIMAL before
-		// calling vkCmdBeginRenderPass. Renderer.beginRendering() calls endRenderPass()
-		// on the previous render pass if the framebuffer changed.
-		Renderer renderer = Renderer.getInstance();
-		renderer.beginRendering(renderPass, vulkanFramebuffer);
+		Renderer.getInstance().beginRendering(renderPass, vulkanFramebuffer);
 	}
 
 	public void bindAsReadBuffer() {
@@ -388,19 +473,33 @@ public class GlFramebuffer extends GlResource {
 	}
 
 	private void cleanUpVulkanResources() {
-		if (vulkanRenderPassClear != null) {
-			vulkanRenderPassClear.cleanUp();
-			vulkanRenderPassClear = null;
+		// Detach from cache entry — cache manages actual cleanup via refCount
+		if (cachedAttachmentHash != 0) {
+			int cacheKey = cachedAttachmentHash * 31 + colorFinalLayout;
+			CachedFramebuffer cached = framebufferCache.get(cacheKey);
+			if (cached != null) {
+				cached.refCount--;
+				if (cached.refCount <= 0) {
+					framebufferCache.remove(cacheKey);
+					cached.cleanUp();
+				}
+			}
 		}
-		if (vulkanRenderPassLoad != null) {
-			vulkanRenderPassLoad.cleanUp();
-			vulkanRenderPassLoad = null;
-		}
-		if (vulkanFramebuffer != null) {
-			vulkanFramebuffer.cleanUp(false); // Don't free images - owned by Iris RenderTargets
-			vulkanFramebuffer = null;
-		}
+		vulkanFramebuffer = null;
+		vulkanRenderPassClear = null;
+		vulkanRenderPassLoad = null;
 		cachedAttachmentHash = 0;
+	}
+
+	/**
+	 * Clears the global framebuffer cache. Call on pipeline reload / shader pack change.
+	 */
+	public static void clearFramebufferCache() {
+		for (CachedFramebuffer cached : framebufferCache.values()) {
+			cached.cleanUp();
+		}
+		framebufferCache.clear();
+		depthTexClearFrame.clear();
 	}
 
 	@Override

@@ -48,9 +48,10 @@ public class IrisVertexFormats {
 			.add("Normal", VertexFormatElement.NORMAL)
 			.padding(1)
 			.add("iris_Entity", ENTITY_ID_ELEMENT)
+			.padding(2) // Align mc_midTexCoord to 4-byte boundary (offset 42→44)
 			.add("mc_midTexCoord", MID_TEXTURE_ELEMENT)
 			.add("at_tangent", TANGENT_ELEMENT)
-			.build();
+			.build(); // stride=56, all FLOAT attributes 4-byte aligned
 
 		GLYPH = VertexFormat.builder()
 			.add("Position", VertexFormatElement.POSITION)
@@ -60,10 +61,10 @@ public class IrisVertexFormats {
 			.add("Normal", VertexFormatElement.NORMAL)
 			.padding(1)
 			.add("iris_Entity", ENTITY_ID_ELEMENT)
+			.padding(2) // Align mc_midTexCoord to 4-byte boundary (offset 38→40)
 			.add("mc_midTexCoord", MID_TEXTURE_ELEMENT)
 			.add("at_tangent", TANGENT_ELEMENT)
-			.padding(1)
-			.build();
+			.build(); // stride=52, all FLOAT attributes 4-byte aligned
 
 		CLOUDS = VertexFormat.builder()
 			.add("Position", VertexFormatElement.POSITION)

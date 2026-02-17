@@ -4,6 +4,7 @@ import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.gl.GlResource;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.uniform.IrisUniformBuffer;
+import net.irisshaders.iris.mixin.GameRendererAccessor;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
 import net.minecraft.client.Minecraft;
 import net.vulkanmod.vulkan.Renderer;
@@ -34,8 +35,7 @@ public final class Program extends GlResource {
 	private static Matrix4fc lastSeenProj = null; // for frame boundary detection
 
 	// Diagnostic: log uniform values written to UBO for first few frames
-	private static int diagUboFrameCount = 0;
-	private static int lastDiagUboFrame = -1;
+	private static int diagLogCount = 0;
 
 	private final String name;
 	private final ProgramUniforms uniforms;
@@ -150,21 +150,39 @@ public final class Program extends GlResource {
 		if (gbufferProj != null) {
 			Matrix4f proj = new Matrix4f(gbufferProj);
 
+			// Save raw values for diagnostic
+			float rawM00 = proj.m00(), rawM11 = proj.m11(), rawM22 = proj.m22();
+			float rawM23 = proj.m23(), rawM32 = proj.m32(), rawM33 = proj.m33();
+
 			// VulkanMod overrides getDepthFar() to return POSITIVE_INFINITY, creating
-			// a projection with infinite far plane. But shader packs use the 'far'
-			// uniform (finite, = renderDistance in blocks) for depth linearization:
-			//   GetDepth(z) = 2*near*far / (far+near - (2*z-1)*(far-near))
-			//   GetDistX(d) = far*(d-near) / (d*(far-near))
-			// These functions produce depth values for a FINITE far perspective.
-			// If gbufferProjectionInverse uses infinite far but GetDistX uses finite
-			// far, the VL ray march reconstructs positions at wrong distances.
-			// Fix: replace the infinite-far depth elements (m22, m32) with finite-far
-			// values matching the 'far' uniform. This makes GetDistX ↔ gbufferProjectionInverse
-			// consistent, fixing VL ray marching and shadow lookups.
+			// a projection with infinite far plane. This causes m00 and m11 to be Infinity
+			// (or other non-standard values). Shader packs need finite, correct values.
+			// Rebuild the ENTIRE perspective projection from actual game parameters.
 			if (proj.m23() != 0) { // perspective projection
 				Minecraft mcClient = Minecraft.getInstance();
 				float far = mcClient.gameRenderer != null ? mcClient.gameRenderer.getRenderDistance() : 256.0f;
 				float near = 0.05f;
+
+				// Rebuild m00/m11 from FOV and aspect ratio (matching terrain pipeline fix)
+				if (!Float.isFinite(proj.m00()) || !Float.isFinite(proj.m11())) {
+					double fovDegrees = 70.0; // default
+					try {
+						if (mcClient.gameRenderer != null) {
+							fovDegrees = ((net.irisshaders.iris.mixin.GameRendererAccessor) mcClient.gameRenderer)
+								.invokeGetFov(mcClient.gameRenderer.getMainCamera(),
+									mcClient.getTimer().getGameTimeDeltaPartialTick(true), true);
+						}
+					} catch (Exception ignored) {}
+					if (fovDegrees < 1.0 || !Double.isFinite(fovDegrees)) fovDegrees = 70.0;
+					float fovRad = (float)(fovDegrees * Math.PI / 180.0);
+					float tanHalfFov = (float) Math.tan(fovRad / 2.0);
+					var window = mcClient.getWindow();
+					float aspect = (float) window.getWidth() / (float) window.getHeight();
+					proj.m00(1.0f / (aspect * tanHalfFov));
+					proj.m11(1.0f / tanHalfFov);
+				}
+
+				// Fix infinite-far depth elements (m22, m32) with finite far
 				// Vulkan zZeroToOne: m22 = -far/(far-near), m32 = -far*near/(far-near)
 				proj.m22(-far / (far - near));
 				proj.m32(-far * near / (far - near));
@@ -180,14 +198,33 @@ public final class Program extends GlResource {
 			//   m32_gl = 2*m32_vk - m33_vk
 			vulkanToOpenGLDepthRange(proj);
 
-			// Negate Y scaling (m11) to compensate for VulkanMod's viewport Y-flip.
-			// CompositeTransformer flips UV.y (1.0 - UV0.y) for correct Vulkan texture
-			// sampling, which inverts clipPos.y. Negating m11 makes the inverse
-			// compensate: viewPos.y = (-1/m11) * (-clipY) = clipY/m11 = correct.
-			proj.m11(-proj.m11());
+			// NOTE: m11 is NOT negated here. Scene shaders (gbuffer) use gl_FragCoord
+			// with the flipped viewport, so they need the original m11 for correct
+			// position reconstruction. Composite/deferred shaders handle the Y mismatch
+			// via iris_flipProjY() injected by CompositeTransformer.
 
 			float[] arr = new float[16];
 			proj.get(arr);
+
+			int projOff = uniformBuffer.getFieldOffset("gbufferProjection");
+			int projInvOff = uniformBuffer.getFieldOffset("gbufferProjectionInverse");
+
+			// Diagnostic: log first few composite UBO writes
+			if (diagLogCount < 3) {
+				diagLogCount++;
+				Matrix4f invCheck = new Matrix4f(proj).invert();
+				Iris.logger.info("[COMP_PROJ] prog='{}' raw=[{},{},{},{},{},{}] final=[{},{},{},{},{},{}] inv11={} off=proj:{} projInv:{}",
+					this.name,
+					String.format("%.4f", rawM00), String.format("%.4f", rawM11),
+					String.format("%.6f", rawM22), String.format("%.4f", rawM23),
+					String.format("%.6f", rawM32), String.format("%.4f", rawM33),
+					String.format("%.4f", proj.m00()), String.format("%.4f", proj.m11()),
+					String.format("%.6f", proj.m22()), String.format("%.4f", proj.m23()),
+					String.format("%.6f", proj.m32()), String.format("%.4f", proj.m33()),
+					String.format("%.4f", invCheck.m11()),
+					projOff, projInvOff);
+			}
+
 			writeMatIfPresent("gbufferProjection", arr);
 			// Save this frame's converted projection for next frame (only first call per frame)
 			if (savedProjArr == null) savedProjArr = arr.clone();
@@ -303,75 +340,6 @@ public final class Program extends GlResource {
 			org.joml.Vector4f upPos = new org.joml.Vector4f(0, 100, 0, 0);
 			preCelestial.transform(upPos);
 			writeVec3IfPresent("upPosition", upPos.x(), upPos.y(), upPos.z());
-		}
-
-		// === DIAGNOSTIC: Log key uniform values for first 5 frames ===
-		int frame = Renderer.getCurrentFrame();
-		if (frame != lastDiagUboFrame) {
-			lastDiagUboFrame = frame;
-			if (diagUboFrameCount++ < 5) {
-				StringBuilder sb = new StringBuilder();
-				sb.append("[DIAG] === Program '").append(name).append("' UBO Values (frame ").append(frame).append(") ===\n");
-
-				if (gbufferProj != null) {
-					// Log the RAW Vulkan projection (before our conversion)
-					sb.append("  gbufferProj(raw): m00=").append(String.format("%.4f", gbufferProj.m00()));
-					sb.append(" m11=").append(String.format("%.4f", gbufferProj.m11()));
-					sb.append(" m22=").append(String.format("%.4f", gbufferProj.m22()));
-					sb.append(" m23=").append(String.format("%.4f", gbufferProj.m23()));
-					sb.append(" m32=").append(String.format("%.4f", gbufferProj.m32()));
-					sb.append(" m33=").append(String.format("%.4f", gbufferProj.m33()));
-					sb.append("\n");
-
-					// Log what we WROTE to the UBO (after conversion + m11 negate)
-					Matrix4f converted = new Matrix4f(gbufferProj);
-					vulkanToOpenGLDepthRange(converted);
-					converted.m11(-converted.m11());
-					sb.append("  gbufferProj(UBO): m00=").append(String.format("%.4f", converted.m00()));
-					sb.append(" m11=").append(String.format("%.4f", converted.m11()));
-					sb.append(" m22=").append(String.format("%.4f", converted.m22()));
-					sb.append(" m23=").append(String.format("%.4f", converted.m23()));
-					sb.append(" m32=").append(String.format("%.4f", converted.m32()));
-					sb.append(" m33=").append(String.format("%.4f", converted.m33()));
-					sb.append("\n");
-				} else {
-					sb.append("  gbufferProjection: NULL\n");
-				}
-
-				if (gbufferMV != null) {
-					sb.append("  gbufferMV: m00=").append(String.format("%.4f", gbufferMV.m00()));
-					sb.append(" m11=").append(String.format("%.4f", gbufferMV.m11()));
-					sb.append(" m22=").append(String.format("%.4f", gbufferMV.m22()));
-					sb.append("\n");
-				} else {
-					sb.append("  gbufferModelView: NULL\n");
-				}
-
-				// sunPosition
-				if (gbufferMV != null && Minecraft.getInstance().level != null) {
-					float tickDelta = CapturedRenderingState.INSTANCE.getTickDelta();
-					float skyAngle2 = Minecraft.getInstance().level.getTimeOfDay(tickDelta);
-					float sunAngle2 = skyAngle2 < 0.75f ? skyAngle2 + 0.25f : skyAngle2 - 0.75f;
-					sb.append("  skyAngle=").append(String.format("%.4f", skyAngle2));
-					sb.append(" sunAngle=").append(String.format("%.4f", sunAngle2));
-					sb.append(" isDay=").append(sunAngle2 <= 0.5f);
-					sb.append("\n");
-				}
-
-				// UBO field offsets — check if key fields are registered
-				String[] keyFields = {"sunPosition", "gbufferProjection", "gbufferModelView", "shadowLightPosition", "upPosition"};
-				sb.append("  UBO field offsets: ");
-				for (String field : keyFields) {
-					int off = uniformBuffer.getFieldOffset(field);
-					sb.append(field).append("=").append(off).append(" ");
-				}
-				sb.append("\n");
-				sb.append("  UBO usedSize=").append(uniformBuffer.getUsedSize());
-				sb.append(" fieldCount=").append(uniformBuffer.getFields().size()).append("\n");
-
-				sb.append("[DIAG] === End Program '").append(name).append("' UBO Values ===");
-				Iris.logger.info(sb.toString());
-			}
 		}
 
 	}

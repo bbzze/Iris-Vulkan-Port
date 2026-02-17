@@ -240,6 +240,11 @@ public class FinalPassRenderer {
 			main.bindWrite(false);
 			RenderSystem.viewport(0, 0, baseWidth, baseHeight);
 
+			// Override with standard Vulkan viewport (Y=0 at top) for final pass.
+			// This fixes texelFetch(tex, ivec2(gl_FragCoord.xy), 0) coordinate mismatch.
+			net.vulkanmod.vulkan.Renderer.setInvertedViewport(0, 0, baseWidth, baseHeight);
+			RenderSystem.disableCull();
+
 			FullScreenQuadRenderer.INSTANCE.begin();
 
 			for (ComputeProgram computeProgram : finalPass.computes) {

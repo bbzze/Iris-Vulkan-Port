@@ -1229,6 +1229,10 @@ public class IrisRenderingPipeline implements WorldRenderingPipeline, ShaderRend
 		IrisRenderSystem.bindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 		IrisRenderSystem.bindFramebuffer(GL_FRAMEBUFFER, 0);
 
+		// Clear the global framebuffer cache — all cached VulkanMod Framebuffers
+		// reference VulkanImages from render targets that are about to be destroyed.
+		net.irisshaders.iris.gl.framebuffer.GlFramebuffer.clearFramebufferCache();
+
 		Minecraft.getInstance().getMainRenderTarget().bindWrite(false);
 
 		renderTargets.destroy();

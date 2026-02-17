@@ -20,6 +20,7 @@ public class IrisUniformBuffer {
 	private final int bufferSize;
 	private final Map<String, FieldInfo> fields;
 	private final int usedSize;
+	private boolean transposeMatrices = false;
 
 	public static class FieldInfo {
 		public final String name;
@@ -126,42 +127,143 @@ public class IrisUniformBuffer {
 		}
 	}
 
+	/**
+	 * Enable matrix transposition for this buffer. When true, writeMat4f/writeMat3f
+	 * transpose from column-major (JOML/OpenGL) to row-major before writing.
+	 *
+	 * ExtendedShader (entity/hand/particle gbuffer shaders) needs this because
+	 * shaderc-compiled SPIR-V reads UBO matrices transposed. Composite/final pass
+	 * shaders do NOT need this (they work correctly without transpose).
+	 */
+	public void setTransposeMatrices(boolean transpose) {
+		this.transposeMatrices = transpose;
+	}
+
 	public void writeMat4f(int byteOffset, FloatBuffer matrix) {
 		if (byteOffset >= 0 && byteOffset + 64 <= bufferSize) {
 			int pos = matrix.position();
-			for (int i = 0; i < 16; i++) {
-				MemoryUtil.memPutFloat(bufferPtr + byteOffset + i * 4, matrix.get(pos + i));
+			if (transposeMatrices) {
+				for (int col = 0; col < 4; col++) {
+					for (int row = 0; row < 4; row++) {
+						MemoryUtil.memPutFloat(bufferPtr + byteOffset + (row * 4 + col) * 4,
+							matrix.get(pos + col * 4 + row));
+					}
+				}
+			} else {
+				for (int i = 0; i < 16; i++) {
+					MemoryUtil.memPutFloat(bufferPtr + byteOffset + i * 4, matrix.get(pos + i));
+				}
 			}
 		}
 	}
 
 	public void writeMat4f(int byteOffset, float[] matrix) {
 		if (byteOffset >= 0 && byteOffset + 64 <= bufferSize) {
-			for (int i = 0; i < Math.min(16, matrix.length); i++) {
-				MemoryUtil.memPutFloat(bufferPtr + byteOffset + i * 4, matrix[i]);
+			if (transposeMatrices) {
+				for (int col = 0; col < 4; col++) {
+					for (int row = 0; row < 4; row++) {
+						int srcIdx = col * 4 + row;
+						int dstIdx = row * 4 + col;
+						if (srcIdx < matrix.length) {
+							MemoryUtil.memPutFloat(bufferPtr + byteOffset + dstIdx * 4, matrix[srcIdx]);
+						}
+					}
+				}
+			} else {
+				for (int i = 0; i < Math.min(16, matrix.length); i++) {
+					MemoryUtil.memPutFloat(bufferPtr + byteOffset + i * 4, matrix[i]);
+				}
 			}
 		}
 	}
 
 	/**
-	 * Writes a mat3 in std140 layout: each column is padded to vec4 (16 bytes).
+	 * Writes a mat3 in std140 layout: each column padded to vec4 (16 bytes).
 	 * Total: 3 columns * 16 bytes = 48 bytes.
+	 *
+	 * When transposeMatrices is true, transposes column-major input to row-major:
+	 *   Input:  [c0r0, c0r1, c0r2, c1r0, c1r1, c1r2, c2r0, c2r1, c2r2]
+	 *   Output: vec4[0]=row0, vec4[1]=row1, vec4[2]=row2
 	 */
 	public void writeMat3f(int byteOffset, float[] matrix) {
 		if (byteOffset >= 0 && byteOffset + 48 <= bufferSize && matrix.length >= 9) {
-			// Column 0 (3 floats + 4 bytes padding)
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 0, matrix[0]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 4, matrix[1]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 8, matrix[2]);
-			// Column 1
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 16, matrix[3]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 20, matrix[4]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 24, matrix[5]);
-			// Column 2
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 32, matrix[6]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 36, matrix[7]);
-			MemoryUtil.memPutFloat(bufferPtr + byteOffset + 40, matrix[8]);
+			if (transposeMatrices) {
+				// Transposed: each vec4 holds a row
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 0, matrix[0]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 4, matrix[3]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 8, matrix[6]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 16, matrix[1]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 20, matrix[4]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 24, matrix[7]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 32, matrix[2]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 36, matrix[5]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 40, matrix[8]);
+			} else {
+				// Column-major: each vec4 holds a column
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 0, matrix[0]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 4, matrix[1]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 8, matrix[2]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 16, matrix[3]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 20, matrix[4]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 24, matrix[5]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 32, matrix[6]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 36, matrix[7]);
+				MemoryUtil.memPutFloat(bufferPtr + byteOffset + 40, matrix[8]);
+			}
 		}
+	}
+
+	/**
+	 * Reads back a mat4 (16 floats, 64 bytes) from the buffer at the given offset.
+	 * Returns null if out of bounds.
+	 */
+	public float[] readbackMat4f(int byteOffset) {
+		if (byteOffset < 0 || byteOffset + 64 > bufferSize) return null;
+		float[] result = new float[16];
+		for (int i = 0; i < 16; i++) {
+			result[i] = MemoryUtil.memGetFloat(bufferPtr + byteOffset + i * 4);
+		}
+		return result;
+	}
+
+	/**
+	 * Reads back a vec3 (3 floats, 12 bytes) from the buffer at the given offset.
+	 */
+	public float[] readbackVec3f(int byteOffset) {
+		if (byteOffset < 0 || byteOffset + 12 > bufferSize) return null;
+		float[] result = new float[3];
+		for (int i = 0; i < 3; i++) {
+			result[i] = MemoryUtil.memGetFloat(bufferPtr + byteOffset + i * 4);
+		}
+		return result;
+	}
+
+	/**
+	 * Dumps the complete field map for diagnostic purposes.
+	 * Returns a formatted string showing every field name, type, offset, and size.
+	 */
+	public String dumpFieldMap() {
+		StringBuilder sb = new StringBuilder();
+		sb.append(String.format("IrisUniformBuffer: %d fields, usedSize=%d, bufferSize=%d, ptr=0x%X\n",
+			fields.size(), usedSize, bufferSize, bufferPtr));
+		// Sort by offset for readable output
+		fields.values().stream()
+			.sorted((a, b) -> Integer.compare(a.byteOffset, b.byteOffset))
+			.forEach(f -> sb.append(String.format("  [%4d..%4d] %-8s %s\n",
+				f.byteOffset, f.byteOffset + f.byteSize - 1, f.type, f.name)));
+		return sb.toString();
+	}
+
+	/**
+	 * Reads back raw bytes from the buffer for hex dump diagnostic.
+	 */
+	public byte[] readbackBytes(int byteOffset, int length) {
+		if (byteOffset < 0 || byteOffset + length > bufferSize) return null;
+		byte[] result = new byte[length];
+		for (int i = 0; i < length; i++) {
+			result[i] = MemoryUtil.memGetByte(bufferPtr + byteOffset + i);
+		}
+		return result;
 	}
 
 	public void free() {

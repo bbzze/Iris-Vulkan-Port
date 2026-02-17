@@ -186,7 +186,7 @@ public class IrisTerrainRenderHook {
 			shadowFramebuffer.bind();
 			// Shadow viewport is already set by ShadowRenderer
 			shadowPassCallCount++;
-			if (diagShadowPassCount < 3) {
+			if (diagShadowPassCount < 1) {
 				diagShadowPassCount++;
 				Iris.logger.info("[SHADOW_DIAG] beginTerrainPass SHADOW: type={} callCount={} depthTexId={} FB={}",
 					renderType, shadowPassCallCount,
@@ -208,7 +208,7 @@ public class IrisTerrainRenderHook {
 				int frame = net.vulkanmod.vulkan.Renderer.getCurrentFrame();
 				if (frame != lastDiagTerrainFrame) {
 					lastDiagTerrainFrame = frame;
-					if (diagTerrainFrameCount++ < 3) {
+					if (diagTerrainFrameCount++ < 1) {
 						int colorCount = framebuffer.getColorAttachments().size();
 						boolean hasDepth = framebuffer.hasDepthAttachment();
 						Iris.logger.info("[DIAG] Terrain gbuffer bind: type={} FB={} colors={} depth={} depthTexId={}",

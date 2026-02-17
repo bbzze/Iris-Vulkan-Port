@@ -385,10 +385,6 @@ public class IrisSPIRVCompiler {
 			// This gives smooth 0.0-1.0 values at shadow boundaries, unlike simple
 			// averaging which only produces 5 discrete levels (0, 0.25, 0.5, 0.75, 1).
 			helpers.append("float iris_shadowComp(sampler2D s, vec3 c) {\n");
-			helpers.append("    // Shadow bias to prevent self-shadowing (shadow acne).\n");
-			helpers.append("    // Vulkan port needs this because shadow depth is computed through different\n");
-			helpers.append("    // code paths (vertex shader undo-redo vs fragment shader PlayerToShadow),\n");
-			helpers.append("    // causing tiny floating-point differences that step() amplifies.\n");
 			helpers.append("    c.z -= 0.001;\n");
 			helpers.append("    vec2 texSize = vec2(textureSize(s, 0));\n");
 			helpers.append("    vec2 texelSize = 1.0 / texSize;\n");
@@ -839,4 +835,196 @@ public class IrisSPIRVCompiler {
 		}
 		return injected;
 	}
+
+	// ==================== SPIR-V UBO Layout Parser ====================
+
+	/**
+	 * Parses a compiled SPIR-V binary to extract UBO member offsets, names,
+	 * and matrix layout decorations (RowMajor vs ColMajor).
+	 *
+	 * This is used to verify that our Java-computed std140 offsets match
+	 * what shaderc actually generated in the SPIR-V bytecode.
+	 *
+	 * @param spirv The compiled SPIR-V bytecode
+	 * @param shaderName Name for logging purposes
+	 * @return A SPIRVLayout describing the UBO, or null if parsing fails
+	 */
+	public static SPIRVLayout parseSPIRVLayout(ByteBuffer spirv, String shaderName) {
+		try {
+			int savedPos = spirv.position();
+			int savedLimit = spirv.limit();
+
+			// SPIR-V header: 5 words (20 bytes)
+			if (spirv.remaining() < 20) return null;
+
+			int magic = spirv.getInt(savedPos);
+			if (magic != 0x07230203) {
+				LOGGER.warn("[SPIRV_PARSE] Invalid magic: 0x{} for {}", Integer.toHexString(magic), shaderName);
+				return null;
+			}
+
+			// Scan instructions for decorations and names
+			Map<Integer, Map<Integer, String>> memberNames = new LinkedHashMap<>(); // typeId -> (memberIdx -> name)
+			Map<Integer, Map<Integer, Integer>> memberOffsets = new LinkedHashMap<>(); // typeId -> (memberIdx -> offset)
+			Set<Integer> blockTypeIds = new LinkedHashSet<>(); // type IDs decorated with Block
+			Map<Integer, Map<Integer, Boolean>> memberRowMajor = new LinkedHashMap<>(); // typeId -> (memberIdx -> isRowMajor)
+			Map<Integer, String> typeNames = new LinkedHashMap<>(); // typeId -> name (from OpName)
+
+			int wordOffset = 5; // skip header (5 words)
+			int totalWords = spirv.remaining() / 4;
+
+			while (wordOffset < totalWords) {
+				int instructionWord = spirv.getInt(savedPos + wordOffset * 4);
+				int opcode = instructionWord & 0xFFFF;
+				int wordCount = (instructionWord >>> 16) & 0xFFFF;
+
+				if (wordCount == 0) break; // safety
+
+				// OpName (5): [opcode/wc] [id] [name_literal...]
+				if (opcode == 5 && wordCount >= 3) {
+					int id = spirv.getInt(savedPos + (wordOffset + 1) * 4);
+					String name = readSPIRVString(spirv, savedPos + (wordOffset + 2) * 4, (wordCount - 2) * 4);
+					typeNames.put(id, name);
+				}
+
+				// OpMemberName (6): [opcode/wc] [type_id] [member_idx] [name_literal...]
+				if (opcode == 6 && wordCount >= 4) {
+					int typeId = spirv.getInt(savedPos + (wordOffset + 1) * 4);
+					int memberIdx = spirv.getInt(savedPos + (wordOffset + 2) * 4);
+					String name = readSPIRVString(spirv, savedPos + (wordOffset + 3) * 4, (wordCount - 3) * 4);
+					memberNames.computeIfAbsent(typeId, k -> new LinkedHashMap<>()).put(memberIdx, name);
+				}
+
+				// OpDecorate (71): [opcode/wc] [target_id] [decoration] [operands...]
+				if (opcode == 71 && wordCount >= 3) {
+					int targetId = spirv.getInt(savedPos + (wordOffset + 1) * 4);
+					int decoration = spirv.getInt(savedPos + (wordOffset + 2) * 4);
+					if (decoration == 2) { // Block decoration
+						blockTypeIds.add(targetId);
+					}
+				}
+
+				// OpMemberDecorate (72): [opcode/wc] [struct_type_id] [member_idx] [decoration] [operands...]
+				if (opcode == 72 && wordCount >= 4) {
+					int typeId = spirv.getInt(savedPos + (wordOffset + 1) * 4);
+					int memberIdx = spirv.getInt(savedPos + (wordOffset + 2) * 4);
+					int decoration = spirv.getInt(savedPos + (wordOffset + 3) * 4);
+
+					if (decoration == 35 && wordCount >= 5) { // Offset
+						int offset = spirv.getInt(savedPos + (wordOffset + 4) * 4);
+						memberOffsets.computeIfAbsent(typeId, k -> new LinkedHashMap<>()).put(memberIdx, offset);
+					}
+					if (decoration == 4) { // RowMajor
+						memberRowMajor.computeIfAbsent(typeId, k -> new LinkedHashMap<>()).put(memberIdx, true);
+					}
+					if (decoration == 5) { // ColMajor
+						memberRowMajor.computeIfAbsent(typeId, k -> new LinkedHashMap<>()).put(memberIdx, false);
+					}
+				}
+
+				wordOffset += wordCount;
+			}
+
+			// Find the IrisUniforms block type
+			// Strategy: look for Block-decorated types that have member offsets
+			Integer uboTypeId = null;
+			for (Integer blockId : blockTypeIds) {
+				if (memberOffsets.containsKey(blockId)) {
+					// Check if this is our IrisUniforms block by looking at the type name
+					String tName = typeNames.get(blockId);
+					if (tName != null && tName.contains("IrisUniforms")) {
+						uboTypeId = blockId;
+						break;
+					}
+					// If no name match, take the first block type with offsets
+					if (uboTypeId == null) {
+						uboTypeId = blockId;
+					}
+				}
+			}
+
+			if (uboTypeId == null) {
+				LOGGER.debug("[SPIRV_PARSE] No UBO block found in {} (blocks={}, offsets={})",
+					shaderName, blockTypeIds.size(), memberOffsets.size());
+				return null;
+			}
+
+			Map<Integer, String> names = memberNames.getOrDefault(uboTypeId, Map.of());
+			Map<Integer, Integer> offsets = memberOffsets.getOrDefault(uboTypeId, Map.of());
+			Map<Integer, Boolean> rowMajors = memberRowMajor.getOrDefault(uboTypeId, Map.of());
+
+			SPIRVLayout layout = new SPIRVLayout(typeNames.getOrDefault(uboTypeId, "UBO"));
+			for (Map.Entry<Integer, Integer> entry : offsets.entrySet()) {
+				int memberIdx = entry.getKey();
+				int offset = entry.getValue();
+				String name = names.getOrDefault(memberIdx, "member_" + memberIdx);
+				Boolean isRowMajor = rowMajors.get(memberIdx);
+				layout.addMember(name, memberIdx, offset, isRowMajor);
+			}
+
+			return layout;
+
+		} catch (Exception e) {
+			LOGGER.warn("[SPIRV_PARSE] Failed to parse SPIR-V for {}: {}", shaderName, e.getMessage());
+			return null;
+		}
+	}
+
+	/**
+	 * Reads a null-terminated UTF-8 string from SPIR-V literal string words.
+	 */
+	private static String readSPIRVString(ByteBuffer buf, int byteOffset, int maxBytes) {
+		StringBuilder sb = new StringBuilder();
+		for (int i = 0; i < maxBytes; i++) {
+			byte b = buf.get(byteOffset + i);
+			if (b == 0) break;
+			sb.append((char) b);
+		}
+		return sb.toString();
+	}
+
+	/**
+	 * Represents the parsed UBO layout from SPIR-V bytecode.
+	 */
+	public static class SPIRVLayout {
+		public final String blockName;
+		public final List<SPIRVMember> members = new ArrayList<>();
+
+		public SPIRVLayout(String blockName) {
+			this.blockName = blockName;
+		}
+
+		public void addMember(String name, int memberIndex, int byteOffset, Boolean isRowMajor) {
+			members.add(new SPIRVMember(name, memberIndex, byteOffset, isRowMajor));
+		}
+
+		/** Get the byte offset for a named member, or -1 if not found */
+		public int getOffset(String name) {
+			for (SPIRVMember m : members) {
+				if (m.name.equals(name)) return m.byteOffset;
+			}
+			return -1;
+		}
+
+		/** Check if any matrix member has RowMajor decoration */
+		public boolean hasAnyRowMajor() {
+			for (SPIRVMember m : members) {
+				if (m.isRowMajor != null && m.isRowMajor) return true;
+			}
+			return false;
+		}
+
+		@Override
+		public String toString() {
+			StringBuilder sb = new StringBuilder();
+			sb.append(String.format("SPIR-V UBO '%s' (%d members):\n", blockName, members.size()));
+			for (SPIRVMember m : members) {
+				sb.append(String.format("  [%4d] %-40s %s\n", m.byteOffset, m.name,
+					m.isRowMajor != null ? (m.isRowMajor ? "RowMajor" : "ColMajor") : ""));
+			}
+			return sb.toString();
+		}
+	}
+
+	public record SPIRVMember(String name, int memberIndex, int byteOffset, Boolean isRowMajor) {}
 }

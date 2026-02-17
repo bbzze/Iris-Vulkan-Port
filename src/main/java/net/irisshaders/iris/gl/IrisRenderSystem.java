@@ -168,22 +168,36 @@ public class IrisRenderSystem {
 	 * Copies depth data from one texture to another using vkCmdCopyImage.
 	 * Used for depthtex1/depthtex2 creation (pre-translucent/pre-hand depth snapshots).
 	 */
+	private static int depthCopyLogCount = 0;
 	public static void copyDepthImage(int srcDepthTexId, int dstDepthTexId, int width, int height) {
 		GlTexture srcGlTex = GlTexture.getTexture(srcDepthTexId);
 		GlTexture dstGlTex = GlTexture.getTexture(dstDepthTexId);
 		if (srcGlTex == null || srcGlTex.getVulkanImage() == null) {
-			Iris.logger.debug("copyDepthImage: No VulkanImage for src tex {}", srcDepthTexId);
+			Iris.logger.warn("[DEPTH_COPY] No VulkanImage for src tex {}", srcDepthTexId);
 			return;
 		}
 		if (dstGlTex == null || dstGlTex.getVulkanImage() == null) {
-			Iris.logger.debug("copyDepthImage: No VulkanImage for dst tex {}", dstDepthTexId);
+			Iris.logger.warn("[DEPTH_COPY] No VulkanImage for dst tex {}", dstDepthTexId);
 			return;
 		}
 
 		VulkanImage srcImage = srcGlTex.getVulkanImage();
 		VulkanImage dstImage = dstGlTex.getVulkanImage();
 
-		if (!Renderer.isRecording()) return;
+		if (!Renderer.isRecording()) {
+			if (depthCopyLogCount < 5) {
+				Iris.logger.warn("[DEPTH_COPY] Renderer not recording! Cannot copy depth {} -> {}", srcDepthTexId, dstDepthTexId);
+				depthCopyLogCount++;
+			}
+			return;
+		}
+
+		if (depthCopyLogCount < 3) {
+			Iris.logger.info("[DEPTH_COPY] Copying depth: src={} ({}x{}, layout={}) -> dst={} ({}x{}, layout={})",
+				srcDepthTexId, srcImage.width, srcImage.height, srcImage.getCurrentLayout(),
+				dstDepthTexId, dstImage.width, dstImage.height, dstImage.getCurrentLayout());
+			depthCopyLogCount++;
+		}
 
 		// End current render pass — vkCmdCopyImage cannot be called inside a render pass
 		Renderer.getInstance().endRenderPass();
@@ -193,21 +207,47 @@ public class IrisRenderSystem {
 			VulkanImage.transitionImageLayout(stack, cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 			VulkanImage.transitionImageLayout(stack, cmd, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-			VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
-			region.srcSubresource()
-				.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
-				.mipLevel(0).baseArrayLayer(0).layerCount(1);
-			region.srcOffset().set(0, 0, 0);
-			region.dstSubresource()
-				.aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
-				.mipLevel(0).baseArrayLayer(0).layerCount(1);
-			region.dstOffset().set(0, 0, 0);
-			region.extent().set(width, height, 1);
+			// Use each image's own aspect mask (DEPTH_BIT for depth formats, COLOR_BIT for R32_SFLOAT etc.)
+			int srcAspect = srcImage.aspect;
+			int dstAspect = dstImage.aspect;
 
-			vkCmdCopyImage(cmd,
-				srcImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-				dstImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-				region);
+			// If aspects differ (e.g. D32_SFLOAT src → R32_SFLOAT dst), we can't use vkCmdCopyImage.
+			// Both must have the same aspect for a direct copy to work.
+			if (srcAspect == dstAspect) {
+				VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+				region.srcSubresource()
+					.aspectMask(srcAspect)
+					.mipLevel(0).baseArrayLayer(0).layerCount(1);
+				region.srcOffset().set(0, 0, 0);
+				region.dstSubresource()
+					.aspectMask(dstAspect)
+					.mipLevel(0).baseArrayLayer(0).layerCount(1);
+				region.dstOffset().set(0, 0, 0);
+				region.extent().set(width, height, 1);
+
+				vkCmdCopyImage(cmd,
+					srcImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					dstImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					region);
+			} else {
+				// Mismatched aspects (depth→color or vice versa): use blit which handles format conversion
+				VkImageBlit.Buffer blitRegion = VkImageBlit.calloc(1, stack);
+				blitRegion.srcSubresource()
+					.aspectMask(srcAspect)
+					.mipLevel(0).baseArrayLayer(0).layerCount(1);
+				blitRegion.srcOffsets(0).set(0, 0, 0);
+				blitRegion.srcOffsets(1).set(width, height, 1);
+				blitRegion.dstSubresource()
+					.aspectMask(dstAspect)
+					.mipLevel(0).baseArrayLayer(0).layerCount(1);
+				blitRegion.dstOffsets(0).set(0, 0, 0);
+				blitRegion.dstOffsets(1).set(width, height, 1);
+
+				vkCmdBlitImage(cmd,
+					srcImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					dstImage.getId(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					blitRegion, VK_FILTER_NEAREST);
+			}
 
 			VulkanImage.transitionImageLayout(stack, cmd, srcImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 			VulkanImage.transitionImageLayout(stack, cmd, dstImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -298,10 +338,20 @@ public class IrisRenderSystem {
 	}
 
 	public static int getViewportWidth() {
+		// VulkanMod doesn't call glViewport, so viewport tracking is never updated
+		// from the rendering pipeline. Fall back to window dimensions.
+		if (viewportWidth <= 1) {
+			var window = net.minecraft.client.Minecraft.getInstance().getWindow();
+			if (window != null) return window.getWidth();
+		}
 		return viewportWidth;
 	}
 
 	public static int getViewportHeight() {
+		if (viewportHeight <= 1) {
+			var window = net.minecraft.client.Minecraft.getInstance().getWindow();
+			if (window != null) return window.getHeight();
+		}
 		return viewportHeight;
 	}
 

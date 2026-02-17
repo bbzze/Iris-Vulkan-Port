@@ -15,10 +15,10 @@ public class IrisTextVertexSinkImpl implements IrisTextVertexSink {
 	private static final int OFFSET_POSITION = 0;
 	private static final int OFFSET_COLOR = 12;
 	private static final int OFFSET_TEXTURE = 16;
-	private static final int OFFSET_MID_TEXTURE = 38;
+	private static final int OFFSET_MID_TEXTURE = 40;
 	private static final int OFFSET_LIGHT = 24;
 	private static final int OFFSET_NORMAL = 28;
-	private static final int OFFSET_TANGENT = 46;
+	private static final int OFFSET_TANGENT = 48;
 	static VertexFormat format = IrisVertexFormats.GLYPH;
 	private final ByteBuffer buffer;
 	private final TextQuadView quad = new TextQuadView();
