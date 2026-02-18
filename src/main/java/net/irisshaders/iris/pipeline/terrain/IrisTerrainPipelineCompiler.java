@@ -187,6 +187,9 @@ public class IrisTerrainPipelineCompiler {
 		vshVulkan = addExplicitBindings(vshVulkan, samplerBindings);
 		fshVulkan = addExplicitBindings(fshVulkan, samplerBindings);
 
+		// Step 4b: Fix vertex-fragment varying type mismatches before SPIR-V compilation
+		fshVulkan = fixVaryingTypeMismatches(vshVulkan, fshVulkan);
+
 		// Step 5: Create IrisUniformBuffer from processed source
 		String uboSource = vshVulkan.contains("IrisUniforms") ? vshVulkan : fshVulkan;
 		IrisUniformBuffer uniformBuffer = IrisUniformBuffer.fromVulkanGLSL(uboSource);
@@ -1611,5 +1614,52 @@ public class IrisTerrainPipelineCompiler {
 			shadowUniformBuffer.free();
 			shadowUniformBuffer = null;
 		}
+	}
+
+	// Pattern for layout-qualified varying declarations
+	private static final Pattern VARYING_DECL_PATTERN = Pattern.compile(
+		"^\\s*layout\\s*\\(\\s*location\\s*=\\s*(\\d+)\\s*\\)\\s*((?:(?:flat|smooth|noperspective)\\s+)*)(out|in)\\s+(\\w+)\\s+(\\w+)\\s*;");
+
+	/**
+	 * Fixes vertex-fragment varying interface mismatches.
+	 * When a fragment input has the same name as a vertex output but a different type,
+	 * the fragment input is converted to a zero-initialized constant.
+	 */
+	private String fixVaryingTypeMismatches(String vshSource, String fshSource) {
+		// Collect vertex shader outputs: name → type
+		Map<String, String> vertexOutTypes = new LinkedHashMap<>();
+		for (String line : vshSource.split("\n", -1)) {
+			Matcher m = VARYING_DECL_PATTERN.matcher(line.trim());
+			if (m.find() && "out".equals(m.group(3))) {
+				vertexOutTypes.put(m.group(5), m.group(4));
+			}
+		}
+
+		if (vertexOutTypes.isEmpty()) return fshSource;
+
+		String[] lines = fshSource.split("\n", -1);
+		List<String> output = new ArrayList<>();
+		int fixCount = 0;
+
+		for (String line : lines) {
+			Matcher m = VARYING_DECL_PATTERN.matcher(line.trim());
+			if (m.find() && "in".equals(m.group(3))) {
+				String type = m.group(4);
+				String name = m.group(5);
+				String vertexType = vertexOutTypes.get(name);
+
+				if (vertexType != null && !vertexType.equals(type)) {
+					output.add("const " + type + " " + name + " = " + type + "(0);");
+					fixCount++;
+					continue;
+				}
+			}
+			output.add(line);
+		}
+
+		if (fixCount > 0) {
+			Iris.logger.info("[VaryingFix] Converted {} terrain fragment inputs with type mismatches to constants", fixCount);
+		}
+		return String.join("\n", output);
 	}
 }

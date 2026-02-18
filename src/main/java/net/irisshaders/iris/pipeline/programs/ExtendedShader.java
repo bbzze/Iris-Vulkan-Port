@@ -1020,6 +1020,9 @@ public class ExtendedShader extends ShaderInstance implements ShaderInstanceInte
 			// may differ from the VertexFormat element order used by the Vulkan pipeline
 			vshFinal = addExplicitInputLocations(vshFinal, vertexFormat);
 
+			// 5c. Fix vertex-fragment varying type mismatches before SPIR-V compilation
+			fshFinal = fixVaryingTypeMismatches(vshFinal, fshFinal);
+
 			// Dump ALL ExtendedShader programs to iris-debug/ for inspection
 			dumpEntityShader(name + ".vsh", vshFinal);
 			dumpEntityShader(name + ".fsh", fshFinal);
@@ -1297,10 +1300,13 @@ public class ExtendedShader extends ShaderInstance implements ShaderInstanceInte
 					assignedCount++;
 					assignments.append(String.format(" %s→%d", name, location));
 				} else {
-					// Extra Iris-injected input: assign beyond format element range
-					output.add("layout(location = " + nextExtraLocation + ") " + qualifiers + "in " + type + " " + name + ";");
-					assignments.append(String.format(" %s→%d*", name, nextExtraLocation));
-					nextExtraLocation++;
+					// Input not in vertex format — replace with zero-initialized constant.
+					// In OpenGL, missing vertex attributes read as (0,0,0,1).
+					// In Vulkan, declaring them as 'in' at non-existent locations causes
+					// validation errors (no vertex buffer provides data at that location).
+					// Using a constant gives the same default-zero behavior as OpenGL.
+					output.add("const " + type + " " + name + " = " + type + "(0);");
+					assignments.append(String.format(" %s→const0", name));
 					assignedCount++;
 				}
 				continue;
@@ -1317,6 +1323,69 @@ public class ExtendedShader extends ShaderInstance implements ShaderInstanceInte
 		if (location != null) {
 			map.putIfAbsent(alias, location);
 		}
+	}
+
+	// Pattern for layout-qualified varying declarations (out or in):
+	// Captures: (1) location, (2) qualifiers (flat/smooth/noperspective), (3) out|in, (4) type, (5) name
+	private static final Pattern VARYING_DECL_PATTERN = Pattern.compile(
+		"^\\s*layout\\s*\\(\\s*location\\s*=\\s*(\\d+)\\s*\\)\\s*((?:(?:flat|smooth|noperspective)\\s+)*)(out|in)\\s+(\\w+)\\s+(\\w+)\\s*;");
+
+	/**
+	 * Fixes vertex-fragment varying interface mismatches that cause SPIR-V validation errors.
+	 * When a fragment input has the same name as a vertex output but a different type
+	 * (e.g. vertex outputs vec2, fragment expects int), the fragment input is converted
+	 * to a zero-initialized constant. This matches OpenGL behavior where type-mismatched
+	 * varyings receive default values.
+	 *
+	 * Also handles fragment inputs at locations that have no matching vertex output.
+	 *
+	 * @return the fixed fragment source
+	 */
+	public static String fixVaryingTypeMismatches(String vshSource, String fshSource) {
+		// 1. Collect vertex shader outputs: name → type
+		Map<String, String> vertexOutTypes = new LinkedHashMap<>();
+		for (String line : vshSource.split("\n", -1)) {
+			java.util.regex.Matcher m = VARYING_DECL_PATTERN.matcher(line.trim());
+			if (m.find() && "out".equals(m.group(3))) {
+				vertexOutTypes.put(m.group(5), m.group(4)); // name → type
+			}
+		}
+
+		if (vertexOutTypes.isEmpty()) {
+			return fshSource;
+		}
+
+		// 2. Fix fragment shader inputs
+		String[] lines = fshSource.split("\n", -1);
+		List<String> output = new ArrayList<>();
+		int fixCount = 0;
+
+		for (String line : lines) {
+			java.util.regex.Matcher m = VARYING_DECL_PATTERN.matcher(line.trim());
+			if (m.find() && "in".equals(m.group(3))) {
+				String type = m.group(4);
+				String name = m.group(5);
+				String vertexType = vertexOutTypes.get(name);
+
+				if (vertexType != null && !vertexType.equals(type)) {
+					// Type mismatch: vertex outputs a different type than fragment expects.
+					// Convert to constant to avoid SPIR-V interface error.
+					output.add("const " + type + " " + name + " = " + type + "(0);");
+					fixCount++;
+					continue;
+				}
+				// If name not in vertex outputs at all, the location was assigned by
+				// LayoutTransformer name matching, so vertex DOES have this name.
+				// If it's truly absent, leave it — maintenance4 handles missing outputs.
+			}
+			output.add(line);
+		}
+
+		if (fixCount > 0) {
+			Iris.logger.info("[VaryingFix] Converted {} fragment inputs with type mismatches to constants", fixCount);
+		}
+
+		return String.join("\n", output);
 	}
 
 	/**

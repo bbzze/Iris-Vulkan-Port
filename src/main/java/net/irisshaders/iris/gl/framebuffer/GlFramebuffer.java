@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.lwjgl.vulkan.VK10.*;
+import static org.lwjgl.vulkan.KHRSwapchain.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 /**
  * Vulkan Framebuffer Wrapper for Iris.
@@ -188,6 +189,8 @@ public class GlFramebuffer extends GlResource {
 
 	// Track which attachment set is cached so we know when to recreate
 	private int cachedAttachmentHash = 0;
+	private static int diagBindCount = 0;
+	private static final int DIAG_BIND_MAX = 60;
 
 	public void bind() {
 		if (!Renderer.isRecording()) {
@@ -349,7 +352,18 @@ public class GlFramebuffer extends GlResource {
 		}
 		RenderPass renderPass = clearDepth ? vulkanRenderPassClear : vulkanRenderPassLoad;
 
-		Renderer.getInstance().beginRendering(renderPass, vulkanFramebuffer);
+		// End current render pass if switching to a different framebuffer.
+		// Layout transitions are now handled by the render pass itself:
+		// initialLayout = finalLayout (e.g. SHADER_READ_ONLY) matches the actual
+		// image layout, and the render pass internally transitions to the subpass
+		// layout (COLOR_ATTACHMENT_OPTIMAL). An input subpass dependency ensures
+		// proper synchronization. No explicit barriers needed.
+		Renderer renderer = Renderer.getInstance();
+		Framebuffer currentBound = renderer.getBoundFramebuffer();
+		if (currentBound != vulkanFramebuffer) {
+			renderer.endRenderPass();
+		}
+		renderer.beginRendering(renderPass, vulkanFramebuffer);
 	}
 
 	public void bindAsReadBuffer() {
@@ -425,6 +439,22 @@ public class GlFramebuffer extends GlResource {
 				if (img != null && img.getCurrentLayout() != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
 					img.transitionImageLayout(stack, cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 				}
+			}
+		}
+	}
+
+	/**
+	 * Transitions this framebuffer's depth attachment to DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+	 * After a render pass with finalLayout=SHADER_READ_ONLY_OPTIMAL (for composite sampling),
+	 * the depth image must be transitioned back before the next render pass that writes depth.
+	 */
+	private void transitionDepthAttachmentForRendering() {
+		if (vulkanFramebuffer == null) return;
+		VulkanImage depthImg = vulkanFramebuffer.getDepthAttachment();
+		if (depthImg != null && depthImg.getCurrentLayout() != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+			VkCommandBuffer cmd = Renderer.getCommandBuffer();
+			try (MemoryStack stack = MemoryStack.stackPush()) {
+				depthImg.transitionImageLayout(stack, cmd, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 			}
 		}
 	}
@@ -514,5 +544,18 @@ public class GlFramebuffer extends GlResource {
 
 	public int getId() {
 		return getGlId();
+	}
+
+	private static String layoutName(int layout) {
+		return switch (layout) {
+			case VK_IMAGE_LAYOUT_UNDEFINED -> "UNDEFINED";
+			case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> "COLOR_ATTACHMENT_OPTIMAL";
+			case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL -> "SHADER_READ_ONLY_OPTIMAL";
+			case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL -> "TRANSFER_DST_OPTIMAL";
+			case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL -> "TRANSFER_SRC_OPTIMAL";
+			case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL -> "DEPTH_STENCIL_ATTACHMENT_OPTIMAL";
+			case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR -> "PRESENT_SRC_KHR";
+			default -> "UNKNOWN(" + layout + ")";
+		};
 	}
 }

@@ -707,6 +707,11 @@ public class IrisRenderSystem {
 
 	public static void memoryBarrier(int barriers) {
 		if (!Renderer.isRecording()) return;
+		// Pipeline barriers cannot be issued inside an active render pass (Vulkan spec
+		// requires a self-dependency subpass which we don't have). When a render pass
+		// is active, skip the barrier — render pass subpass dependencies handle the
+		// synchronization between passes.
+		if (Renderer.getInstance().getBoundFramebuffer() != null) return;
 		VkCommandBuffer cmd = Renderer.getCommandBuffer();
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			VkMemoryBarrier.Buffer memBarrier = VkMemoryBarrier.calloc(1, stack)

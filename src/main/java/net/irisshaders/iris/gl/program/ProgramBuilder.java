@@ -16,6 +16,7 @@ import net.irisshaders.iris.gl.state.ValueUpdateNotifier;
 import net.irisshaders.iris.gl.texture.InternalTextureFormat;
 import net.irisshaders.iris.gl.texture.TextureType;
 import net.irisshaders.iris.gl.uniform.IrisUniformBuffer;
+import net.irisshaders.iris.pipeline.programs.ExtendedShader;
 import net.irisshaders.iris.vulkan.shader.IrisSPIRVCompiler;
 import net.vulkanmod.vulkan.shader.GraphicsPipeline;
 import net.vulkanmod.vulkan.shader.Pipeline;
@@ -112,6 +113,9 @@ public class ProgramBuilder extends ProgramUniforms.Builder implements SamplerHo
 				collectSamplerNamesFromGLSL(vshVulkan, samplerNames);
 				collectSamplerNamesFromGLSL(fshVulkan, samplerNames);
 				IrisRenderSystem.registerSamplerNames(programId, samplerNames);
+
+				// Fix vertex-fragment varying type mismatches before SPIR-V compilation
+				fshVulkan = ExtendedShader.fixVaryingTypeMismatches(vshVulkan, fshVulkan);
 
 				// Dump composite shader GLSL to iris-debug/ for inspection
 				dumpCompositeShader(name + ".vsh", vshVulkan);
@@ -232,6 +236,9 @@ public class ProgramBuilder extends ProgramUniforms.Builder implements SamplerHo
 		// Add explicit bindings to GLSL
 		String vshFinal = addExplicitBindings(vshVulkan, samplerBindings);
 		String fshFinal = addExplicitBindings(fshVulkan, samplerBindings);
+
+		// Fix vertex-fragment varying type mismatches
+		fshFinal = ExtendedShader.fixVaryingTypeMismatches(vshFinal, fshFinal);
 
 		// Re-compile with bindings
 		ByteBuffer vSpirv = IrisSPIRVCompiler.compilePreprocessed(name + ".vsh", vshFinal, ShaderType.VERTEX);
