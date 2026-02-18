@@ -210,7 +210,7 @@ public final class Program extends GlResource {
 			int projInvOff = uniformBuffer.getFieldOffset("gbufferProjectionInverse");
 
 			// Diagnostic: log first few composite UBO writes
-			if (diagLogCount < 3) {
+			if (diagLogCount < 5) {
 				diagLogCount++;
 				Matrix4f invCheck = new Matrix4f(proj).invert();
 				Iris.logger.info("[COMP_PROJ] prog='{}' raw=[{},{},{},{},{},{}] final=[{},{},{},{},{},{}] inv11={} off=proj:{} projInv:{}",
@@ -233,6 +233,50 @@ public final class Program extends GlResource {
 			inv.invert();
 			inv.get(arr);
 			writeMatIfPresent("gbufferProjectionInverse", arr);
+
+			// Diagnostic: readback projection inverse to verify UBO data integrity
+			if (diagLogCount <= 5 && projInvOff >= 0) {
+				float[] pInvRB = uniformBuffer.readbackMat4f(projInvOff);
+				if (pInvRB != null) {
+					// Critical check: col2[3] (arr[11]) should be ~-10 (=1/m32), col3[2] (arr[14]) should be ~-1
+					// If swapped, matrix is transposed or inverse is wrong
+					Iris.logger.info("[DIAG_PROJINV] prog='{}' col2=({},{},{},{}) col3=({},{},{},{})",
+						this.name,
+						String.format("%.4f", pInvRB[8]), String.format("%.4f", pInvRB[9]),
+						String.format("%.4f", pInvRB[10]), String.format("%.4f", pInvRB[11]),
+						String.format("%.4f", pInvRB[12]), String.format("%.4f", pInvRB[13]),
+						String.format("%.4f", pInvRB[14]), String.format("%.4f", pInvRB[15]));
+
+					// Simulate shader viewPos reconstruction for top-center sky pixel
+					// texCoord=(0.5, 0.0), depth=1.0 → NDC=(0, -1, 1, 1)
+					// After iris_flipProjY (negate col1): use -pInvRB[4..7] for col1
+					float ndc_x = 0.0f, ndc_y = -1.0f, ndc_z = 1.0f, ndc_w = 1.0f;
+					float vx = pInvRB[0]*ndc_x + (-pInvRB[4])*ndc_y + pInvRB[8]*ndc_z + pInvRB[12]*ndc_w;
+					float vy = pInvRB[1]*ndc_x + (-pInvRB[5])*ndc_y + pInvRB[9]*ndc_z + pInvRB[13]*ndc_w;
+					float vz = pInvRB[2]*ndc_x + (-pInvRB[6])*ndc_y + pInvRB[10]*ndc_z + pInvRB[14]*ndc_w;
+					float vw = pInvRB[3]*ndc_x + (-pInvRB[7])*ndc_y + pInvRB[11]*ndc_z + pInvRB[15]*ndc_w;
+					float viewY = vy / vw;
+					float viewZ = vz / vw;
+					float len = (float) Math.sqrt(viewY*viewY + viewZ*viewZ);
+					float VdotU_approx = viewY / len; // assuming level camera, upVec=(0,1,0)
+					Iris.logger.info("[DIAG_VIEWPOS] prog='{}' topCenter: viewY={} viewZ={} vw={} VdotU_approx={}",
+						this.name,
+						String.format("%.4f", viewY), String.format("%.4f", viewZ),
+						String.format("%.6f", vw), String.format("%.4f", VdotU_approx));
+				}
+
+				// Also readback MV and MV inverse for upVec verification
+				int mvOff = uniformBuffer.getFieldOffset("gbufferModelView");
+				float[] mvRB = uniformBuffer.readbackMat4f(mvOff);
+				if (mvRB != null) {
+					// Column 1 = upVec direction: (mvRB[4], mvRB[5], mvRB[6])
+					Iris.logger.info("[DIAG_MV] prog='{}' col1(upVec)=({},{},{}) col0(eastVec)=({},{},{})",
+						this.name,
+						String.format("%.4f", mvRB[4]), String.format("%.4f", mvRB[5]), String.format("%.4f", mvRB[6]),
+						String.format("%.4f", mvRB[0]), String.format("%.4f", mvRB[1]), String.format("%.4f", mvRB[2]));
+				}
+			}
+
 			// Previous frame projection
 			if (prevProjArr != null) {
 				writeMatIfPresent("gbufferPreviousProjection", prevProjArr);
